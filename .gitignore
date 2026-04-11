@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+.venv/
+env/
+
+# Environment / secrets (never commit real credentials)
+.env
+.env.*
+.streamlit/secrets.toml
+
+# Local app data (users, sessions, uploads cache)
+data/app.db
+
+# Authorized emails — keep local only; use faculty_allowlist.example.txt in repo
+data/faculty_allowlist.txt
+
+# Logs
+*.log
+streamlit.out.log
+
+# OS / editor
+.DS_Store
+Thumbs.db

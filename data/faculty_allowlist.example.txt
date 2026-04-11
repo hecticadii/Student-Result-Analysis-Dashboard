@@ -1,0 +1,5 @@
+# Copy this file to faculty_allowlist.txt and add real emails (one per line).
+# Lines starting with # are ignored.
+# Example:
+# faculty.one@university.edu
+# faculty.two@university.edu
