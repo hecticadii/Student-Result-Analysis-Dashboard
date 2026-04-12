@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 # Academic Result Intelligence Dashboard
 
 This project analyzes university result workbooks and turns them into a Streamlit dashboard with term-wise analytics, student drill-down views, subject performance summaries, and exportable Excel reports.
@@ -180,3 +181,7 @@ In the current sample, the workbook contains a `test` sheet and represents a sem
 - This project is set up for local use and faculty workflow automation, not hardened production deployment.
 - The committed SQLite database may already contain local history or user data depending on prior use.
 - `dashboard.html` and the `Aryan-ui-droid` folder appear to be unused prototype or leftover UI files and are not required to run the Python app.
+=======
+# Student-Result-Analysis-Dashboard
+“An intelligent dashboard that allows faculty to upload raw student Excel data, automatically cleans and analyzes it, and generates insights such as toppers and performance metrics.”
+>>>>>>> 9e0e04f11c7f9c1b8326e45bdda9e9469c83a094
