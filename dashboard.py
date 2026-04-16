@@ -19,6 +19,24 @@ from result_engine import ResultEngine
 
 st.set_page_config(page_title="Result Analysis Dashboard", page_icon="R", layout="wide")
 
+
+def apply_streamlit_secrets_to_environ():
+    """Streamlit Cloud / local .streamlit/secrets.toml → os.environ for AIRAS_* and SMTP keys."""
+    try:
+        for key in st.secrets:
+            val = st.secrets[key]
+            if isinstance(val, (dict, list)):
+                continue
+            if isinstance(val, bool):
+                os.environ[str(key)] = "1" if val else "0"
+            else:
+                os.environ[str(key)] = str(val)
+    except Exception:
+        pass
+
+
+apply_streamlit_secrets_to_environ()
+
 THEMES = {
     "Cobalt Sunrise": {
         "bg_a": "#f4f9ff",
@@ -68,8 +86,36 @@ SUMMARY_FILTER_LABELS = {
 }
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-DB_PATH = os.path.join(BASE_DIR, "data", "app.db")
-FACULTY_ALLOWLIST_PATH = os.path.join(BASE_DIR, "data", "faculty_allowlist.txt")
+DEFAULT_DATA_DIR = os.path.join(BASE_DIR, "data")
+DATA_DIR = os.environ.get("AIRAS_DATA_DIR", DEFAULT_DATA_DIR)
+DB_PATH = os.path.join(DATA_DIR, "app.db")
+PRIMARY_ALLOWLIST_PATH = os.path.join(DATA_DIR, "faculty_allowlist.txt")
+REPO_ALLOWLIST_PATH = os.path.join(BASE_DIR, "data", "faculty_allowlist.txt")
+LOCAL_ALLOWLIST_PATH = os.path.join(BASE_DIR, "faculty_allowlist.txt")
+SECRET_ALLOWLIST_PATH = "/etc/secrets/faculty_allowlist.txt"
+
+
+def allowlist_paths():
+    paths = []
+    custom_path = os.environ.get("AIRAS_ALLOWLIST_FILE", "").strip()
+    if custom_path:
+        paths.append(custom_path)
+    paths.extend(
+        [
+            PRIMARY_ALLOWLIST_PATH,
+            REPO_ALLOWLIST_PATH,
+            LOCAL_ALLOWLIST_PATH,
+            SECRET_ALLOWLIST_PATH,
+        ]
+    )
+
+    unique_paths = []
+    seen = set()
+    for path in paths:
+        if path and path not in seen:
+            unique_paths.append(path)
+            seen.add(path)
+    return unique_paths
 
 
 def registration_secret_expected():
@@ -98,15 +144,22 @@ def load_faculty_allowlist():
     """Return a set of normalized login emails (or legacy IDs), or None if bypass is active."""
     if faculty_allowlist_bypassed():
         return None
-    if not os.path.isfile(FACULTY_ALLOWLIST_PATH):
-        return frozenset()
     entries = set()
-    with open(FACULTY_ALLOWLIST_PATH, encoding="utf-8", errors="ignore") as f:
-        for line in f:
-            line = line.strip()
-            if not line or line.startswith("#"):
-                continue
-            entries.add(line.lower())
+    env_emails = os.environ.get("AIRAS_ALLOWED_EMAILS", "")
+    if env_emails.strip():
+        for part in env_emails.split(","):
+            e = part.strip().lower()
+            if e:
+                entries.add(e)
+    for path in allowlist_paths():
+        if not os.path.isfile(path):
+            continue
+        with open(path, encoding="utf-8", errors="ignore") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                entries.add(line.lower())
     return frozenset(entries)
 
 
@@ -120,9 +173,10 @@ def is_authorized_faculty(username: str) -> bool:
 
 
 def ensure_faculty_allowlist_template():
-    if os.path.isfile(FACULTY_ALLOWLIST_PATH):
+    if load_faculty_allowlist():
         return
-    with open(FACULTY_ALLOWLIST_PATH, "w", encoding="utf-8") as f:
+    os.makedirs(os.path.dirname(PRIMARY_ALLOWLIST_PATH), exist_ok=True)
+    with open(PRIMARY_ALLOWLIST_PATH, "w", encoding="utf-8") as f:
         f.write(
             "# Only these addresses may register and log in (one per line, case-insensitive).\n"
             "# Use the same email users will type on the login screen.\n"
@@ -134,7 +188,7 @@ def ensure_faculty_allowlist_template():
 
 
 def ensure_db():
-    os.makedirs(os.path.join(BASE_DIR, "data"), exist_ok=True)
+    os.makedirs(DATA_DIR, exist_ok=True)
     ensure_faculty_allowlist_template()
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
