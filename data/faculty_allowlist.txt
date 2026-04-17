@@ -1,3 +1,4 @@
 # Authorized faculty emails (login must match exactly, case-insensitive)
 adiamrute141@gmail.com
 aryantribhuvan0702@gmail.com
+mmaid@mgmu.ac.in
