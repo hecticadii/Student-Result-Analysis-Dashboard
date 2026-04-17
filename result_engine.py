@@ -448,8 +448,8 @@ class ResultEngine:
         max_scan = min(40, len(preview))
 
         for i in range(max_scan):
-            row_vals = preview.iloc[i].astype(str).str.strip()
-            row_lower = row_vals.str.lower().tolist()
+            row_vals = preview.iloc[i].fillna("").astype(str).str.strip()
+            row_lower = [str(x).strip().lower() for x in row_vals.tolist()]
 
             has_roll = any("roll" in x or "prn" in x for x in row_lower)
             has_name = any("name" in x or "student" in x for x in row_lower)
