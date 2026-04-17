@@ -286,6 +286,64 @@ def user_email_registered(username):
     return found
 
 
+def reset_user_account(email):
+    email = (email or "").strip().lower()
+    if not email:
+        return False
+
+    marker_name = f".reset_user_{sha1(email.encode('utf-8')).hexdigest()[:16]}"
+    marker_path = os.path.join(DATA_DIR, marker_name)
+    if os.path.exists(marker_path):
+        return False
+
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("SELECT id FROM users WHERE lower(username) = lower(?) LIMIT 1", (email,))
+    row = cur.fetchone()
+    if row is None:
+        conn.close()
+        return False
+
+    user_id = row[0]
+    cur.execute("SELECT token FROM sessions WHERE user_id = ?", (user_id,))
+    tokens = [token_row[0] for token_row in cur.fetchall()]
+    if tokens:
+        cur.executemany("DELETE FROM session_uploads WHERE token = ?", [(token,) for token in tokens])
+        cur.executemany("DELETE FROM sessions WHERE token = ?", [(token,) for token in tokens])
+
+    cur.execute("DELETE FROM history WHERE user_id = ?", (user_id,))
+    cur.execute("DELETE FROM registration_pending WHERE lower(email) = lower(?)", (email,))
+    cur.execute("DELETE FROM users WHERE id = ?", (user_id,))
+    conn.commit()
+    conn.close()
+
+    try:
+        with open(marker_path, "w", encoding="utf-8") as f:
+            f.write(datetime.now().isoformat())
+    except OSError:
+        pass
+
+    return True
+
+
+def apply_requested_account_resets():
+    raw = os.environ.get("AIRAS_RESET_USER_EMAILS", "").strip()
+    if not raw:
+        return []
+
+    removed = []
+    for part in raw.split(","):
+        email = part.strip().lower()
+        if not email:
+            continue
+        if reset_user_account(email):
+            removed.append(email)
+
+    if removed:
+        print(f"[AIRAS_RESET_USER_EMAILS] Reset accounts: {', '.join(removed)}", flush=True)
+    return removed
+
+
 def validate_registration_prerequisites(username, name, department, password, registration_code=None):
     username = (username or "").strip().lower()
     name = (name or "").strip()
@@ -4234,6 +4292,7 @@ def render_term_tabs(ctx, theme, risk_threshold):
                 )
 
 ensure_db()
+apply_requested_account_resets()
 if "user" not in st.session_state:
     st.session_state["user"] = None
 if "session_token" not in st.session_state:
