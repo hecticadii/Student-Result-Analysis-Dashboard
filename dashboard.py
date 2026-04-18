@@ -85,6 +85,9 @@ SUMMARY_FILTER_LABELS = {
     "failed": "Failed Students",
 }
 
+OTP_EXPIRY_MINUTES = 15
+OTP_RESEND_COOLDOWN_SECONDS = 60
+
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_DATA_DIR = os.path.join(BASE_DIR, "data")
 DATA_DIR = os.environ.get("AIRAS_DATA_DIR", DEFAULT_DATA_DIR)
@@ -373,7 +376,7 @@ def smtp_configured():
 
 
 def email_verification_enabled():
-    return smtp_configured() or email_debug_mode()
+    return True
 
 
 def hash_verification_code(code: str, salt: str) -> str:
@@ -381,18 +384,31 @@ def hash_verification_code(code: str, salt: str) -> str:
     return pbkdf2_hmac("sha256", c.encode("utf-8"), salt.encode("utf-8"), 50000).hex()
 
 
-def generate_verification_code():
+def generate_otp():
     salt = token_hex(8)
     n = int.from_bytes(os.urandom(4), "big") % 900000 + 100000
     digits = f"{n:06d}"
     return digits, hash_verification_code(digits, salt), salt
 
 
+def generate_verification_code():
+    return generate_otp()
+
+
 def delete_expired_pending_registrations(cur):
     cur.execute("DELETE FROM registration_pending WHERE expires_at < ?", (datetime.now().isoformat(),))
 
 
-def send_registration_verification_email(to_email: str, plain_code: str) -> tuple[bool, str]:
+def _pending_registration_cooldown_remaining(created_at: str) -> int:
+    try:
+        sent_at = datetime.fromisoformat(created_at)
+    except Exception:
+        return 0
+    remaining = OTP_RESEND_COOLDOWN_SECONDS - int((datetime.now() - sent_at).total_seconds())
+    return max(0, remaining)
+
+
+def send_email_otp(to_email: str, plain_code: str) -> tuple[bool, str]:
     if email_debug_mode():
         print(f"[AIRAS_EMAIL_DEBUG] Verification code for {to_email}: {plain_code}", flush=True)
         return True, ""
@@ -428,21 +444,34 @@ def send_registration_verification_email(to_email: str, plain_code: str) -> tupl
     return True, ""
 
 
+def send_registration_verification_email(to_email: str, plain_code: str) -> tuple[bool, str]:
+    return send_email_otp(to_email, plain_code)
+
+
 def request_registration_verification(username, name, department, password, registration_code=None):
     ok, payload = validate_registration_prerequisites(username, name, department, password, registration_code)
     if not ok:
         return False, payload
     data = payload
-    plain, code_hash, code_salt = generate_verification_code()
-    send_ok, send_err = send_registration_verification_email(data["username"], plain)
-    if not send_ok:
-        return False, send_err
-    password_hash, salt = hash_password(password)
-    now = datetime.now().isoformat()
-    expires = (datetime.now() + timedelta(minutes=15)).isoformat()
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
     delete_expired_pending_registrations(cur)
+    cur.execute("SELECT created_at FROM registration_pending WHERE email = ?", (data["username"],))
+    existing = cur.fetchone()
+    if existing is not None:
+        wait_seconds = _pending_registration_cooldown_remaining(existing[0])
+        if wait_seconds > 0:
+            conn.close()
+            return False, f"Please wait {wait_seconds} seconds before requesting another code."
+
+    plain, code_hash, code_salt = generate_otp()
+    send_ok, send_err = send_email_otp(data["username"], plain)
+    if not send_ok:
+        conn.close()
+        return False, send_err
+    password_hash, salt = hash_password(password)
+    now = datetime.now().isoformat()
+    expires = (datetime.now() + timedelta(minutes=OTP_EXPIRY_MINUTES)).isoformat()
     cur.execute(
         """
         INSERT OR REPLACE INTO registration_pending (
@@ -466,7 +495,7 @@ def request_registration_verification(username, name, department, password, regi
     return True, "Verification code sent. Check your inbox (and spam folder)."
 
 
-def complete_registration_verification(username, code_entered):
+def verify_otp(username, code_entered):
     username = (username or "").strip().lower()
     code_entered = (code_entered or "").strip()
     if not username or not code_entered:
@@ -512,22 +541,35 @@ def complete_registration_verification(username, code_entered):
     return True, "Account created."
 
 
+def complete_registration_verification(username, code_entered):
+    return verify_otp(username, code_entered)
+
+
 def resend_registration_verification(email):
     email = (email or "").strip().lower()
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
     delete_expired_pending_registrations(cur)
     cur.execute("SELECT email FROM registration_pending WHERE email = ?", (email,))
-    if cur.fetchone() is None:
+    row = cur.fetchone()
+    if row is None:
         conn.close()
         return False, "No pending registration. Submit the registration form again."
-    plain, code_hash, code_salt = generate_verification_code()
-    send_ok, send_err = send_registration_verification_email(email, plain)
+    cur.execute("SELECT created_at FROM registration_pending WHERE email = ?", (email,))
+    created_row = cur.fetchone()
+    if created_row is not None:
+        wait_seconds = _pending_registration_cooldown_remaining(created_row[0])
+        if wait_seconds > 0:
+            conn.close()
+            return False, f"Please wait {wait_seconds} seconds before requesting another code."
+
+    plain, code_hash, code_salt = generate_otp()
+    send_ok, send_err = send_email_otp(email, plain)
     if not send_ok:
         conn.close()
         return False, send_err
     now = datetime.now().isoformat()
-    expires = (datetime.now() + timedelta(minutes=15)).isoformat()
+    expires = (datetime.now() + timedelta(minutes=OTP_EXPIRY_MINUTES)).isoformat()
     cur.execute(
         """
         UPDATE registration_pending
@@ -541,11 +583,22 @@ def resend_registration_verification(email):
     return True, "A new code was sent to your email."
 
 
+def cancel_pending_registration(email):
+    email = (email or "").strip().lower()
+    if not email:
+        return
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("DELETE FROM registration_pending WHERE email = ?", (email,))
+    conn.commit()
+    conn.close()
+
+
 def create_user(username, name, department, password, is_admin=0, registration_code=None):
     if email_verification_enabled():
         return (
             False,
-            "This server requires email verification. Use **Send verification code** on the registration form.",
+            "Use the Send verification code step first. Your account will be created only after OTP verification.",
         )
     ok, payload = validate_registration_prerequisites(username, name, department, password, registration_code)
     if not ok:
@@ -2800,55 +2853,36 @@ def login_screen():
 
         with register_tab:
             st.markdown('<div class="login-card-title">Create Account</div>', unsafe_allow_html=True)
-
-            if email_verification_enabled():
-                if st.session_state.get("reg_verify_email"):
-                    em = st.session_state["reg_verify_email"]
-                    flash = st.session_state.pop("reg_flash", None)
-                    if flash:
-                        (st.success if flash[0] == "success" else st.error)(flash[1])
-                    with st.form("reg_verify_form"):
-                        otp = st.text_input("Verification code", key="reg_otp_input")
-                        vsub = st.form_submit_button("Verify and create account")
-                    if vsub:
-                        ok, msg = complete_registration_verification(em, otp)
-                        if ok:
-                            st.session_state.pop("reg_verify_email", None)
-                            st.success("Account created.")
-                        else:
-                            st.error(msg)
-                    c1, c2 = st.columns(2)
-                    with c1:
-                        if st.button("Resend code", key="reg_resend_btn"):
-                            ok_r, msg_r = resend_registration_verification(em)
-                            st.session_state["reg_flash"] = ("success" if ok_r else "error", msg_r)
-                            st.rerun()
-                    with c2:
-                        if st.button("Start over", key="reg_cancel_btn"):
-                            cancel_pending_registration(em)
-                            st.session_state.pop("reg_verify_email", None)
-                            st.rerun()
-                else:
-                    with st.form("register_form_send_code"):
-                        full_name = st.text_input("Full Name", key="reg_name")
-                        department = st.text_input("Department", key="reg_dept")
-                        username = st.text_input("Email", key="reg_user")
-                        password = st.text_input("Password", type="password", key="reg_pass")
-                        reg_code = None
-                        if registration_secret_required():
-                            reg_code = st.text_input("Registration key", type="password", key="reg_secret")
-                        submit = st.form_submit_button("Send verification code")
-                    if submit:
-                        ok, message = request_registration_verification(
-                            username, full_name, department, password, registration_code=reg_code
-                        )
-                        if ok:
-                            st.session_state["reg_verify_email"] = (username or "").strip().lower()
-                            st.rerun()
-                        else:
-                            st.error(message)
+            flash = st.session_state.pop("reg_flash", None)
+            if flash:
+                (st.success if flash[0] == "success" else st.error)(flash[1])
+            if st.session_state.get("reg_verify_email"):
+                em = st.session_state["reg_verify_email"]
+                st.caption(f"Verification code sent to {em}")
+                with st.form("reg_verify_form"):
+                    otp = st.text_input("Verification code", key="reg_otp_input")
+                    vsub = st.form_submit_button("Verify and create account")
+                if vsub:
+                    ok, msg = verify_otp(em, otp)
+                    if ok:
+                        st.session_state["reg_flash"] = ("success", "Account created.")
+                        st.session_state.pop("reg_verify_email", None)
+                        st.rerun()
+                    else:
+                        st.error(msg)
+                c1, c2 = st.columns(2)
+                with c1:
+                    if st.button("Resend code", key="reg_resend_btn"):
+                        ok_r, msg_r = resend_registration_verification(em)
+                        st.session_state["reg_flash"] = ("success" if ok_r else "error", msg_r)
+                        st.rerun()
+                with c2:
+                    if st.button("Start over", key="reg_cancel_btn"):
+                        cancel_pending_registration(em)
+                        st.session_state.pop("reg_verify_email", None)
+                        st.rerun()
             else:
-                with st.form("register_form"):
+                with st.form("register_form_send_code"):
                     full_name = st.text_input("Full Name", key="reg_name")
                     department = st.text_input("Department", key="reg_dept")
                     username = st.text_input("Email", key="reg_user")
@@ -2856,11 +2890,15 @@ def login_screen():
                     reg_code = None
                     if registration_secret_required():
                         reg_code = st.text_input("Registration key", type="password", key="reg_secret")
-                    submit = st.form_submit_button("Create Account")
+                    submit = st.form_submit_button("Send verification code")
                 if submit:
-                    ok, message = create_user(username, full_name, department, password, registration_code=reg_code)
+                    ok, message = request_registration_verification(
+                        username, full_name, department, password, registration_code=reg_code
+                    )
                     if ok:
-                        st.success("Account created.")
+                        st.session_state["reg_verify_email"] = (username or "").strip().lower()
+                        st.session_state["reg_flash"] = ("success", message)
+                        st.rerun()
                     else:
                         st.error(message)
 
