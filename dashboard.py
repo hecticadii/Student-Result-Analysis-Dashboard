@@ -376,7 +376,7 @@ def smtp_configured():
 
 
 def email_verification_enabled():
-    return True
+    return False
 
 
 def hash_verification_code(code: str, salt: str) -> str:
@@ -597,11 +597,6 @@ def cancel_pending_registration(email):
 
 
 def create_user(username, name, department, password, is_admin=0, registration_code=None):
-    if email_verification_enabled():
-        return (
-            False,
-            "Use the Send verification code step first. Your account will be created only after OTP verification.",
-        )
     ok, payload = validate_registration_prerequisites(username, name, department, password, registration_code)
     if not ok:
         return False, payload
@@ -2858,51 +2853,22 @@ def login_screen():
             flash = st.session_state.pop("reg_flash", None)
             if flash:
                 (st.success if flash[0] == "success" else st.error)(flash[1])
-            if st.session_state.get("reg_verify_email"):
-                em = st.session_state["reg_verify_email"]
-                st.caption(f"Verification code sent to {em}")
-                with st.form("reg_verify_form"):
-                    otp = st.text_input("Verification code", key="reg_otp_input")
-                    vsub = st.form_submit_button("Verify and create account")
-                if vsub:
-                    ok, msg = verify_otp(em, otp)
-                    if ok:
-                        st.session_state["reg_flash"] = ("success", "Account created.")
-                        st.session_state.pop("reg_verify_email", None)
-                        st.rerun()
-                    else:
-                        st.error(msg)
-                c1, c2 = st.columns(2)
-                with c1:
-                    if st.button("Resend code", key="reg_resend_btn"):
-                        ok_r, msg_r = resend_registration_verification(em)
-                        st.session_state["reg_flash"] = ("success" if ok_r else "error", msg_r)
-                        st.rerun()
-                with c2:
-                    if st.button("Start over", key="reg_cancel_btn"):
-                        cancel_pending_registration(em)
-                        st.session_state.pop("reg_verify_email", None)
-                        st.rerun()
-            else:
-                with st.form("register_form_send_code"):
-                    full_name = st.text_input("Full Name", key="reg_name")
-                    department = st.text_input("Department", key="reg_dept")
-                    username = st.text_input("Email", key="reg_user")
-                    password = st.text_input("Password", type="password", key="reg_pass")
-                    reg_code = None
-                    if registration_secret_required():
-                        reg_code = st.text_input("Registration key", type="password", key="reg_secret")
-                    submit = st.form_submit_button("Send verification code")
-                if submit:
-                    ok, message = request_registration_verification(
-                        username, full_name, department, password, registration_code=reg_code
-                    )
-                    if ok:
-                        st.session_state["reg_verify_email"] = (username or "").strip().lower()
-                        st.session_state["reg_flash"] = ("success", message)
-                        st.rerun()
-                    else:
-                        st.error(message)
+            with st.form("register_form"):
+                full_name = st.text_input("Full Name", key="reg_name")
+                department = st.text_input("Department", key="reg_dept")
+                username = st.text_input("Email", key="reg_user")
+                password = st.text_input("Password", type="password", key="reg_pass")
+                reg_code = None
+                if registration_secret_required():
+                    reg_code = st.text_input("Registration key", type="password", key="reg_secret")
+                submit = st.form_submit_button("Create Account")
+            if submit:
+                ok, message = create_user(username, full_name, department, password, registration_code=reg_code)
+                if ok:
+                    st.session_state["reg_flash"] = ("success", message)
+                    st.rerun()
+                else:
+                    st.error(message)
 
         with login_tab:
             with st.form("login_form"):
