@@ -265,17 +265,6 @@ def ensure_db():
         )
         """
     )
-    cur.execute(
-        """
-        CREATE TABLE IF NOT EXISTS password_reset_pending (
-            email TEXT PRIMARY KEY,
-            code_hash TEXT NOT NULL,
-            code_salt TEXT NOT NULL,
-            created_at TEXT NOT NULL,
-            expires_at TEXT NOT NULL
-        )
-        """
-    )
     conn.commit()
     conn.close()
 
@@ -324,7 +313,6 @@ def reset_user_account(email):
 
     cur.execute("DELETE FROM history WHERE user_id = ?", (user_id,))
     cur.execute("DELETE FROM registration_pending WHERE lower(email) = lower(?)", (email,))
-    cur.execute("DELETE FROM password_reset_pending WHERE lower(email) = lower(?)", (email,))
     cur.execute("DELETE FROM users WHERE id = ?", (user_id,))
     conn.commit()
     conn.close()
@@ -404,10 +392,6 @@ def delete_expired_pending_registrations(cur):
     cur.execute("DELETE FROM registration_pending WHERE expires_at < ?", (datetime.now().isoformat(),))
 
 
-def delete_expired_pending_password_resets(cur):
-    cur.execute("DELETE FROM password_reset_pending WHERE expires_at < ?", (datetime.now().isoformat(),))
-
-
 def send_registration_verification_email(to_email: str, plain_code: str) -> tuple[bool, str]:
     if email_debug_mode():
         print(f"[AIRAS_EMAIL_DEBUG] Verification code for {to_email}: {plain_code}", flush=True)
@@ -430,42 +414,6 @@ def send_registration_verification_email(to_email: str, plain_code: str) -> tupl
             "Enter it on the registration page to finish creating your account. "
             "This code expires in about 15 minutes.\n\n"
             "If you did not start registration, you can ignore this email.\n"
-        )
-        with smtplib.SMTP(host, port, timeout=45) as smtp:
-            smtp.ehlo()
-            if use_tls:
-                smtp.starttls()
-                smtp.ehlo()
-            if user or password:
-                smtp.login(user, password)
-            smtp.send_message(msg)
-    except Exception as exc:
-        return False, f"Could not send the email ({type(exc).__name__}). Check SMTP settings or try again."
-    return True, ""
-
-
-def send_password_reset_email(to_email: str, plain_code: str) -> tuple[bool, str]:
-    if email_debug_mode():
-        print(f"[AIRAS_EMAIL_DEBUG] Password reset code for {to_email}: {plain_code}", flush=True)
-        return True, ""
-    host = os.environ.get("AIRAS_SMTP_HOST", "").strip()
-    if not host:
-        return False, "SMTP host is not configured."
-    port = int(os.environ.get("AIRAS_SMTP_PORT", "587").strip() or "587")
-    user = os.environ.get("AIRAS_SMTP_USER", "").strip()
-    password = os.environ.get("AIRAS_SMTP_PASSWORD", "")
-    from_addr = os.environ.get("AIRAS_SMTP_FROM", "").strip() or user or "noreply@localhost"
-    use_tls = os.environ.get("AIRAS_SMTP_USE_TLS", "1").strip().lower() not in ("0", "false", "no")
-    try:
-        msg = EmailMessage()
-        msg["Subject"] = "Your password reset code"
-        msg["From"] = from_addr
-        msg["To"] = to_email
-        msg.set_content(
-            f"Your password reset code is: {plain_code}\n\n"
-            "Enter it on the login page to set a new password. "
-            "This code expires in about 15 minutes.\n\n"
-            "If you did not request a password reset, you can ignore this email.\n"
         )
         with smtplib.SMTP(host, port, timeout=45) as smtp:
             smtp.ehlo()
@@ -591,139 +539,6 @@ def resend_registration_verification(email):
     conn.commit()
     conn.close()
     return True, "A new code was sent to your email."
-
-
-def cancel_pending_registration(email):
-    email = (email or "").strip().lower()
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute("DELETE FROM registration_pending WHERE email = ?", (email,))
-    conn.commit()
-    conn.close()
-
-
-def request_password_reset(email):
-    email = (email or "").strip().lower()
-    if not email:
-        return False, "Enter your email address."
-    if not faculty_allowlist_bypassed() and not is_authorized_faculty(email):
-        if not load_faculty_allowlist():
-            return (
-                False,
-                "No authorized email list is configured yet. An administrator must add allowed emails to data/faculty_allowlist.txt (one per line).",
-            )
-        return False, "This email is not on the authorized list. Contact your administrator."
-    if not user_email_registered(email):
-        return False, "No account for this email yet."
-
-    plain, code_hash, code_salt = generate_verification_code()
-    send_ok, send_err = send_password_reset_email(email, plain)
-    if not send_ok:
-        return False, send_err
-
-    now = datetime.now().isoformat()
-    expires = (datetime.now() + timedelta(minutes=15)).isoformat()
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    delete_expired_pending_password_resets(cur)
-    cur.execute(
-        """
-        INSERT OR REPLACE INTO password_reset_pending (
-            email, code_hash, code_salt, created_at, expires_at
-        ) VALUES (?, ?, ?, ?, ?)
-        """,
-        (email, code_hash, code_salt, now, expires),
-    )
-    conn.commit()
-    conn.close()
-    return True, "Password reset code sent. Check your inbox (and spam folder)."
-
-
-def resend_password_reset_code(email):
-    email = (email or "").strip().lower()
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    delete_expired_pending_password_resets(cur)
-    cur.execute("SELECT email FROM password_reset_pending WHERE email = ?", (email,))
-    if cur.fetchone() is None:
-        conn.close()
-        return False, "No pending password reset. Request a new reset code."
-    plain, code_hash, code_salt = generate_verification_code()
-    send_ok, send_err = send_password_reset_email(email, plain)
-    if not send_ok:
-        conn.close()
-        return False, send_err
-    now = datetime.now().isoformat()
-    expires = (datetime.now() + timedelta(minutes=15)).isoformat()
-    cur.execute(
-        """
-        UPDATE password_reset_pending
-        SET code_hash = ?, code_salt = ?, created_at = ?, expires_at = ?
-        WHERE email = ?
-        """,
-        (code_hash, code_salt, now, expires, email),
-    )
-    conn.commit()
-    conn.close()
-    return True, "A new reset code was sent to your email."
-
-
-def cancel_password_reset(email):
-    email = (email or "").strip().lower()
-    if not email:
-        return
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute("DELETE FROM password_reset_pending WHERE email = ?", (email,))
-    conn.commit()
-    conn.close()
-
-
-def complete_password_reset(email, code_entered, new_password, confirm_password):
-    email = (email or "").strip().lower()
-    code_entered = (code_entered or "").strip()
-    new_password = new_password or ""
-    confirm_password = confirm_password or ""
-    if not email or not code_entered or not new_password:
-        return False, "Enter the reset code and a new password."
-    if new_password != confirm_password:
-        return False, "Passwords do not match."
-
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    cur = conn.cursor()
-    delete_expired_pending_password_resets(cur)
-    cur.execute("SELECT * FROM password_reset_pending WHERE email = ?", (email,))
-    row = cur.fetchone()
-    if row is None:
-        conn.close()
-        return False, "No pending password reset for this email. Request a new reset code."
-    if datetime.now().isoformat() > row["expires_at"]:
-        cur.execute("DELETE FROM password_reset_pending WHERE email = ?", (email,))
-        conn.commit()
-        conn.close()
-        return False, "That reset code has expired. Request a new code."
-    if not compare_digest(hash_verification_code(code_entered, row["code_salt"]), row["code_hash"]):
-        conn.close()
-        return False, "Invalid reset code."
-
-    cur.execute("SELECT id FROM users WHERE lower(username) = lower(?) LIMIT 1", (email,))
-    user_row = cur.fetchone()
-    if user_row is None:
-        cur.execute("DELETE FROM password_reset_pending WHERE email = ?", (email,))
-        conn.commit()
-        conn.close()
-        return False, "No account found for this email."
-
-    password_hash, salt = hash_password(new_password)
-    user_id = user_row["id"]
-    cur.execute("UPDATE users SET password_hash = ?, salt = ? WHERE id = ?", (password_hash, salt, user_id))
-    cur.execute("DELETE FROM session_uploads WHERE token IN (SELECT token FROM sessions WHERE user_id = ?)", (user_id,))
-    cur.execute("DELETE FROM sessions WHERE user_id = ?", (user_id,))
-    cur.execute("DELETE FROM password_reset_pending WHERE email = ?", (email,))
-    conn.commit()
-    conn.close()
-    return True, "Password updated. You can log in with the new password now."
 
 
 def create_user(username, name, department, password, is_admin=0, registration_code=None):
@@ -1036,9 +851,6 @@ def perform_logout():
         st.session_state["profile_source_signature"] = None
     if "last_history_signature" in st.session_state:
         del st.session_state["last_history_signature"]
-    for key in ("show_password_reset", "password_reset_stage", "password_reset_email", "fp_flash"):
-        if key in st.session_state:
-            del st.session_state[key]
     clear_summary_filter_state()
     clear_query_params()
     for k in ("reg_verify_email", "reg_flash"):
@@ -2974,76 +2786,6 @@ def extract_academic_details(file_bytes, sheet_name):
     return details
 
 
-def render_password_reset_flow():
-    st.markdown('<div class="login-card-title" style="margin-top:18px;">Forgot password?</div>', unsafe_allow_html=True)
-    st.markdown(
-        '<div class="login-card-subtitle">We will email a reset code to your registered faculty address.</div>',
-        unsafe_allow_html=True,
-    )
-
-    flash = st.session_state.pop("fp_flash", None)
-    if flash:
-        (st.success if flash[0] == "success" else st.error)(flash[1])
-
-    stage = st.session_state.get("password_reset_stage", "request")
-    email = st.session_state.get("password_reset_email", "")
-
-    if stage == "verify" and email:
-        st.caption(f"Reset code sent to {email}")
-        with st.form("password_reset_verify_form"):
-            code = st.text_input("Verification code", key="fp_code")
-            new_password = st.text_input("New password", type="password", key="fp_new_password")
-            confirm_password = st.text_input("Confirm new password", type="password", key="fp_confirm_password")
-            submit = st.form_submit_button("Update password")
-        if submit:
-            ok, message = complete_password_reset(email, code, new_password, confirm_password)
-            if ok:
-                st.session_state["fp_flash"] = ("success", message)
-                st.session_state["show_password_reset"] = False
-                st.session_state["password_reset_stage"] = ""
-                st.session_state["password_reset_email"] = ""
-                st.rerun()
-            else:
-                st.error(message)
-
-        left, right = st.columns(2)
-        with left:
-            if st.button("Resend code", key="fp_resend_code_btn"):
-                ok, message = resend_password_reset_code(email)
-                if ok:
-                    st.session_state["fp_flash"] = ("success", message)
-                    st.rerun()
-                else:
-                    st.error(message)
-        with right:
-            if st.button("Back to login", key="fp_back_to_login_btn"):
-                cancel_password_reset(email)
-                st.session_state["show_password_reset"] = False
-                st.session_state["password_reset_stage"] = ""
-                st.session_state["password_reset_email"] = ""
-                st.rerun()
-    else:
-        with st.form("password_reset_request_form"):
-            reset_email = st.text_input("Registered email", key="fp_request_email")
-            submit = st.form_submit_button("Send reset code")
-        if submit:
-            ok, message = request_password_reset(reset_email)
-            if ok:
-                st.session_state["password_reset_stage"] = "verify"
-                st.session_state["password_reset_email"] = (reset_email or "").strip().lower()
-                st.session_state["show_password_reset"] = True
-                st.session_state["fp_flash"] = ("success", message)
-                st.rerun()
-            else:
-                st.error(message)
-
-        if st.button("Back to login", key="fp_back_to_login_request_btn"):
-            st.session_state["show_password_reset"] = False
-            st.session_state["password_reset_stage"] = ""
-            st.session_state["password_reset_email"] = ""
-            st.rerun()
-
-
 def login_screen():
     bg = load_login_background()
     apply_login_theme(bg)
@@ -3128,9 +2870,6 @@ def login_screen():
                 username = st.text_input("Email", key="login_user")
                 password = st.text_input("Password", type="password", key="login_pass")
                 submit = st.form_submit_button("Login")
-            flash = st.session_state.pop("fp_flash", None)
-            if flash:
-                (st.success if flash[0] == "success" else st.error)(flash[1])
             if submit:
                 if not username.strip() or not password:
                     st.error("Enter your email and password.")
@@ -3155,13 +2894,6 @@ def login_screen():
                             st.error("Invalid email or password.")
                         else:
                             st.error("No account for this email yet.")
-
-            if st.button("Forgot password?", key="forgot_password_btn"):
-                st.session_state["show_password_reset"] = True
-                st.session_state["password_reset_stage"] = "request"
-
-            if st.session_state.get("show_password_reset"):
-                render_password_reset_flow()
 
 
 def upload_screen():
@@ -4564,12 +4296,6 @@ if "engine_cache" not in st.session_state:
     st.session_state["engine_cache"] = None
 if "engine_signature" not in st.session_state:
     st.session_state["engine_signature"] = ""
-if "show_password_reset" not in st.session_state:
-    st.session_state["show_password_reset"] = False
-if "password_reset_stage" not in st.session_state:
-    st.session_state["password_reset_stage"] = ""
-if "password_reset_email" not in st.session_state:
-    st.session_state["password_reset_email"] = ""
 
 if st.session_state["user"] is None:
     token = get_query_param("session")
