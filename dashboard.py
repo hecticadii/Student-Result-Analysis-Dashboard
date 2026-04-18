@@ -268,6 +268,17 @@ def ensure_db():
         )
         """
     )
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS password_reset_pending (
+            email TEXT PRIMARY KEY,
+            code_hash TEXT NOT NULL,
+            code_salt TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            expires_at TEXT NOT NULL
+        )
+        """
+    )
     conn.commit()
     conn.close()
 
@@ -316,6 +327,7 @@ def reset_user_account(email):
 
     cur.execute("DELETE FROM history WHERE user_id = ?", (user_id,))
     cur.execute("DELETE FROM registration_pending WHERE lower(email) = lower(?)", (email,))
+    cur.execute("DELETE FROM password_reset_pending WHERE lower(email) = lower(?)", (email,))
     cur.execute("DELETE FROM users WHERE id = ?", (user_id,))
     conn.commit()
     conn.close()
@@ -408,9 +420,20 @@ def _pending_registration_cooldown_remaining(created_at: str) -> int:
     return max(0, remaining)
 
 
-def send_email_otp(to_email: str, plain_code: str) -> tuple[bool, str]:
+def send_email_otp(
+    to_email: str,
+    plain_code: str,
+    subject: str = "Your account verification code",
+    intro_lines=None,
+) -> tuple[bool, str]:
+    if intro_lines is None:
+        intro_lines = [
+            "Enter it on the registration page to finish creating your account. This code expires in about 15 minutes.",
+            "",
+            "If you did not start registration, you can ignore this email.",
+        ]
     if email_debug_mode():
-        print(f"[AIRAS_EMAIL_DEBUG] Verification code for {to_email}: {plain_code}", flush=True)
+        print(f"[AIRAS_EMAIL_DEBUG] {subject} for {to_email}: {plain_code}", flush=True)
         return True, ""
     user = os.environ.get("AIRAS_SMTP_USER", "").strip()
     password = os.environ.get("AIRAS_SMTP_PASSWORD", "")
@@ -423,16 +446,12 @@ def send_email_otp(to_email: str, plain_code: str) -> tuple[bool, str]:
     from_addr = os.environ.get("AIRAS_SMTP_FROM", "").strip() or user or "noreply@localhost"
     use_tls = os.environ.get("AIRAS_SMTP_USE_TLS", "1").strip().lower() not in ("0", "false", "no")
     try:
+        body_lines = [f"Your verification code is: {plain_code}", "", *intro_lines]
         msg = EmailMessage()
-        msg["Subject"] = "Your account verification code"
+        msg["Subject"] = subject
         msg["From"] = from_addr
         msg["To"] = to_email
-        msg.set_content(
-            f"Your verification code is: {plain_code}\n\n"
-            "Enter it on the registration page to finish creating your account. "
-            "This code expires in about 15 minutes.\n\n"
-            "If you did not start registration, you can ignore this email.\n"
-        )
+        msg.set_content("\n".join(body_lines))
         with smtplib.SMTP(host, port, timeout=45) as smtp:
             smtp.ehlo()
             if use_tls:
@@ -594,6 +613,158 @@ def cancel_pending_registration(email):
     cur.execute("DELETE FROM registration_pending WHERE email = ?", (email,))
     conn.commit()
     conn.close()
+
+
+def delete_expired_password_resets(cur):
+    cur.execute("DELETE FROM password_reset_pending WHERE expires_at < ?", (datetime.now().isoformat(),))
+
+
+def request_password_reset_code(username):
+    username = (username or "").strip().lower()
+    if not username:
+        return False, "Enter your email address."
+    if not is_authorized_faculty(username):
+        if not faculty_allowlist_bypassed() and not load_faculty_allowlist():
+            return (
+                False,
+                "No authorized email list is configured yet. An administrator must add allowed emails to data/faculty_allowlist.txt (one per line).",
+            )
+        return False, "This email is not on the authorized list. Contact your administrator."
+    if not user_email_registered(username):
+        return False, "No account for this email yet."
+
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    delete_expired_password_resets(cur)
+    cur.execute("SELECT created_at FROM password_reset_pending WHERE email = ?", (username,))
+    existing = cur.fetchone()
+    if existing is not None:
+        wait_seconds = _pending_registration_cooldown_remaining(existing[0])
+        if wait_seconds > 0:
+            conn.close()
+            return False, f"Please wait {wait_seconds} seconds before requesting another code."
+
+    plain, code_hash, code_salt = generate_otp()
+    send_ok, send_err = send_email_otp(
+        username,
+        plain,
+        subject="Reset your AIRAS password",
+        intro_lines=[
+            "Use this code on the password reset screen to choose a new password.",
+            "",
+            "This code expires in about 15 minutes.",
+            "",
+            "If you did not request a reset, you can ignore this email.",
+        ],
+    )
+    if not send_ok:
+        conn.close()
+        return False, send_err
+
+    now = datetime.now().isoformat()
+    expires = (datetime.now() + timedelta(minutes=OTP_EXPIRY_MINUTES)).isoformat()
+    cur.execute(
+        """
+        INSERT OR REPLACE INTO password_reset_pending (
+            email, code_hash, code_salt, created_at, expires_at
+        ) VALUES (?, ?, ?, ?, ?)
+        """,
+        (username, code_hash, code_salt, now, expires),
+    )
+    conn.commit()
+    conn.close()
+    return True, "Reset code sent. Check your inbox (and spam folder)."
+
+
+def resend_password_reset_code(email):
+    email = (email or "").strip().lower()
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    delete_expired_password_resets(cur)
+    cur.execute("SELECT created_at FROM password_reset_pending WHERE email = ?", (email,))
+    row = cur.fetchone()
+    if row is None:
+        conn.close()
+        return False, "No pending password reset. Request a new code."
+    wait_seconds = _pending_registration_cooldown_remaining(row[0])
+    if wait_seconds > 0:
+        conn.close()
+        return False, f"Please wait {wait_seconds} seconds before requesting another code."
+
+    plain, code_hash, code_salt = generate_otp()
+    send_ok, send_err = send_email_otp(
+        email,
+        plain,
+        subject="Reset your AIRAS password",
+        intro_lines=[
+            "Use this code on the password reset screen to choose a new password.",
+            "",
+            "This code expires in about 15 minutes.",
+            "",
+            "If you did not request a reset, you can ignore this email.",
+        ],
+    )
+    if not send_ok:
+        conn.close()
+        return False, send_err
+
+    now = datetime.now().isoformat()
+    expires = (datetime.now() + timedelta(minutes=OTP_EXPIRY_MINUTES)).isoformat()
+    cur.execute(
+        """
+        UPDATE password_reset_pending
+        SET code_hash = ?, code_salt = ?, created_at = ?, expires_at = ?
+        WHERE email = ?
+        """,
+        (code_hash, code_salt, now, expires, email),
+    )
+    conn.commit()
+    conn.close()
+    return True, "A new reset code was sent to your email."
+
+
+def complete_password_reset(username, code_entered, new_password):
+    username = (username or "").strip().lower()
+    code_entered = (code_entered or "").strip()
+    new_password = (new_password or "").strip()
+    if not username or not code_entered or not new_password:
+        return False, "Enter the reset code and a new password."
+
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    cur = conn.cursor()
+    delete_expired_password_resets(cur)
+    cur.execute("SELECT * FROM password_reset_pending WHERE email = ?", (username,))
+    row = cur.fetchone()
+    if row is None:
+        conn.close()
+        return False, "No pending password reset for this email. Request a new code."
+    if datetime.now().isoformat() > row["expires_at"]:
+        cur.execute("DELETE FROM password_reset_pending WHERE email = ?", (username,))
+        conn.commit()
+        conn.close()
+        return False, "That code has expired. Request a new code."
+    if not compare_digest(hash_verification_code(code_entered, row["code_salt"]), row["code_hash"]):
+        conn.close()
+        return False, "Invalid reset code."
+
+    cur.execute("SELECT id FROM users WHERE lower(username) = lower(?) LIMIT 1", (username,))
+    user_row = cur.fetchone()
+    if user_row is None:
+        cur.execute("DELETE FROM password_reset_pending WHERE email = ?", (username,))
+        conn.commit()
+        conn.close()
+        return False, "No account for this email yet."
+
+    password_hash, salt = hash_password(new_password)
+    user_id = user_row["id"]
+    cur.execute("UPDATE users SET password_hash = ?, salt = ? WHERE id = ?", (password_hash, salt, user_id))
+    cur.execute("DELETE FROM session_uploads WHERE token IN (SELECT token FROM sessions WHERE user_id = ?)", (user_id,))
+    cur.execute("DELETE FROM sessions WHERE user_id = ?", (user_id,))
+    cur.execute("DELETE FROM password_reset_pending WHERE email = ?", (username,))
+    conn.commit()
+    conn.close()
+    return True, "Password updated. You can log in with your new password."
 
 
 def create_user(username, name, department, password, is_admin=0, registration_code=None):
@@ -888,6 +1059,21 @@ def clear_summary_filter_state():
             del st.session_state[key]
 
 
+def clear_password_reset_state():
+    for key in (
+        "pwd_reset_show",
+        "pwd_reset_step",
+        "pwd_reset_email",
+        "pwd_reset_flash",
+        "pwd_reset_request_email",
+        "pwd_reset_code",
+        "pwd_reset_new_password",
+        "pwd_reset_confirm_password",
+    ):
+        if key in st.session_state:
+            del st.session_state[key]
+
+
 def perform_logout():
     delete_session_upload(st.session_state.get("session_token"))
     delete_session(st.session_state.get("session_token"))
@@ -902,6 +1088,7 @@ def perform_logout():
     if "last_history_signature" in st.session_state:
         del st.session_state["last_history_signature"]
     clear_summary_filter_state()
+    clear_password_reset_state()
     clear_query_params()
     for k in ("reg_verify_email", "reg_flash"):
         if k in st.session_state:
@@ -2836,6 +3023,64 @@ def extract_academic_details(file_bytes, sheet_name):
     return details
 
 
+def render_password_reset_section():
+    st.markdown('<div class="login-card-title" style="margin-top:1rem;">Forgot password?</div>', unsafe_allow_html=True)
+    st.caption("We will email a reset code to your registered faculty address.")
+    flash = st.session_state.pop("pwd_reset_flash", None)
+    if flash:
+        (st.success if flash[0] == "success" else st.error)(flash[1])
+
+    step = st.session_state.get("pwd_reset_step", "request")
+    email = (st.session_state.get("pwd_reset_email") or "").strip().lower()
+
+    if step != "verify" or not email:
+        with st.form("pwd_reset_request_form"):
+            request_email = st.text_input("Registered email", key="pwd_reset_request_email")
+            submit = st.form_submit_button("Send reset code")
+        if submit:
+            ok, message = request_password_reset_code(request_email)
+            if ok:
+                st.session_state["pwd_reset_show"] = True
+                st.session_state["pwd_reset_step"] = "verify"
+                st.session_state["pwd_reset_email"] = (request_email or "").strip().lower()
+                st.session_state["pwd_reset_flash"] = ("success", message)
+                st.rerun()
+            else:
+                st.error(message)
+        return
+
+    st.caption(f"Reset code sent to {email}")
+    with st.form("pwd_reset_verify_form"):
+        code = st.text_input("Reset code", key="pwd_reset_code")
+        new_password = st.text_input("New password", type="password", key="pwd_reset_new_password")
+        confirm_password = st.text_input("Confirm new password", type="password", key="pwd_reset_confirm_password")
+        submit = st.form_submit_button("Reset password")
+    if submit:
+        if new_password != confirm_password:
+            st.error("Passwords do not match.")
+        else:
+            ok, message = complete_password_reset(email, code, new_password)
+            if ok:
+                clear_password_reset_state()
+                st.session_state["pwd_reset_show"] = True
+                st.session_state["pwd_reset_step"] = "request"
+                st.session_state["pwd_reset_flash"] = ("success", message)
+                st.rerun()
+            else:
+                st.error(message)
+
+    c1, c2 = st.columns(2)
+    with c1:
+        if st.button("Resend code", key="pwd_reset_resend_btn"):
+            ok, message = resend_password_reset_code(email)
+            st.session_state["pwd_reset_flash"] = ("success" if ok else "error", message)
+            st.rerun()
+    with c2:
+        if st.button("Back to login", key="pwd_reset_back_btn"):
+            clear_password_reset_state()
+            st.rerun()
+
+
 def login_screen():
     bg = load_login_background()
     apply_login_theme(bg)
@@ -2900,6 +3145,14 @@ def login_screen():
                             st.error("Invalid email or password.")
                         else:
                             st.error("No account for this email yet.")
+
+            st.markdown("<div style='height:0.4rem;'></div>", unsafe_allow_html=True)
+            if st.button("Forgot password?", key="pwd_reset_open_btn"):
+                st.session_state["pwd_reset_show"] = True
+                st.session_state["pwd_reset_step"] = "request"
+                st.rerun()
+            if st.session_state.get("pwd_reset_show"):
+                render_password_reset_section()
 
 
 def upload_screen():
