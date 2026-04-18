@@ -412,12 +412,14 @@ def send_email_otp(to_email: str, plain_code: str) -> tuple[bool, str]:
     if email_debug_mode():
         print(f"[AIRAS_EMAIL_DEBUG] Verification code for {to_email}: {plain_code}", flush=True)
         return True, ""
+    user = os.environ.get("AIRAS_SMTP_USER", "").strip()
+    password = os.environ.get("AIRAS_SMTP_PASSWORD", "")
     host = os.environ.get("AIRAS_SMTP_HOST", "").strip()
+    if not host and (user or password):
+        host = "smtp.gmail.com"
     if not host:
         return False, "SMTP host is not configured."
     port = int(os.environ.get("AIRAS_SMTP_PORT", "587").strip() or "587")
-    user = os.environ.get("AIRAS_SMTP_USER", "").strip()
-    password = os.environ.get("AIRAS_SMTP_PASSWORD", "")
     from_addr = os.environ.get("AIRAS_SMTP_FROM", "").strip() or user or "noreply@localhost"
     use_tls = os.environ.get("AIRAS_SMTP_USE_TLS", "1").strip().lower() not in ("0", "false", "no")
     try:
