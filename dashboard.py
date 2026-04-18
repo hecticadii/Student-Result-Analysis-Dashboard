@@ -3146,14 +3146,6 @@ def login_screen():
                         else:
                             st.error("No account for this email yet.")
 
-            st.markdown("<div style='height:0.4rem;'></div>", unsafe_allow_html=True)
-            if st.button("Forgot password?", key="pwd_reset_open_btn"):
-                st.session_state["pwd_reset_show"] = True
-                st.session_state["pwd_reset_step"] = "request"
-                st.rerun()
-            if st.session_state.get("pwd_reset_show"):
-                render_password_reset_section()
-
 
 def upload_screen():
     top_left, top_right = st.columns([2.2, 1])
