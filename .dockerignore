@@ -1,0 +1,15 @@
+.git
+.gitignore
+__pycache__
+*.pyc
+.venv
+venv
+.env
+.env.*
+data/app.db
+data/faculty_allowlist.txt
+*.log
+.vscode
+.idea
+streamlit.out.log
+streamlit.err.log

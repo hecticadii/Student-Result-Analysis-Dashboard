@@ -1,0 +1,12 @@
+# https://docs.streamlit.io/develop/api-reference/configuration/config.toml
+
+[server]
+# Cloud hosts can override the port at runtime through CLI flags in start.py.
+headless = true
+address = "0.0.0.0"
+port = 8501
+maxUploadSize = 200
+enableXsrfProtection = true
+
+[browser]
+gatherUsageStats = false
