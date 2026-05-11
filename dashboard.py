@@ -1,10 +1,11 @@
 import io
 import os
 import smtplib
-import sqlite3
+from contextlib import contextmanager
 from email.message import EmailMessage
 from html import escape
 from hashlib import pbkdf2_hmac, sha1
+from pathlib import Path
 from secrets import compare_digest, token_hex
 from base64 import b64encode
 import re
@@ -13,6 +14,10 @@ from datetime import datetime, timedelta
 
 import pandas as pd
 import streamlit as st
+from sqlalchemy import Boolean, Column, Float, ForeignKey, Integer, LargeBinary, String, create_engine, delete, event, inspect, select
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm import declarative_base, sessionmaker
+from werkzeug.security import check_password_hash, generate_password_hash
 
 from report_generator import ReportGenerator
 from result_engine import ResultEngine
@@ -96,6 +101,26 @@ PRIMARY_ALLOWLIST_PATH = os.path.join(DATA_DIR, "faculty_allowlist.txt")
 REPO_ALLOWLIST_PATH = os.path.join(BASE_DIR, "data", "faculty_allowlist.txt")
 LOCAL_ALLOWLIST_PATH = os.path.join(BASE_DIR, "faculty_allowlist.txt")
 SECRET_ALLOWLIST_PATH = "/etc/secrets/faculty_allowlist.txt"
+
+
+def build_database_url():
+    database_url = (
+        os.environ.get("DATABASE_URL")
+        or os.environ.get("AIRAS_DATABASE_URL")
+        or os.environ.get("SQLALCHEMY_DATABASE_URI")
+        or ""
+    ).strip()
+    if database_url:
+        if database_url.startswith("postgres://"):
+            database_url = "postgresql+psycopg2://" + database_url[len("postgres://") :]
+        elif database_url.startswith("postgresql://") and "+psycopg" not in database_url:
+            database_url = "postgresql+psycopg2://" + database_url[len("postgresql://") :]
+        return database_url
+    sqlite_path = Path(DB_PATH).resolve().as_posix()
+    return f"sqlite:///{sqlite_path}"
+
+
+DATABASE_URL = build_database_url()
 
 
 def allowlist_paths():
@@ -190,118 +215,289 @@ def ensure_faculty_allowlist_template():
         )
 
 
+Base = declarative_base()
+
+
+class User(Base):
+    __tablename__ = "users"
+
+    id = Column(Integer, primary_key=True)
+    email = Column(String(255), unique=True, nullable=False, index=True)
+    name = Column(String(255), nullable=False)
+    department = Column(String(255), nullable=True)
+    password_hash = Column("password", String(255), nullable=False)
+    salt = Column(String(64), nullable=True)
+    is_admin = Column(Boolean, nullable=False, default=False)
+    created_at = Column(String(32), nullable=False)
+
+
+class History(Base):
+    __tablename__ = "history"
+
+    id = Column(Integer, primary_key=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    uploaded_at = Column(String(32), nullable=False)
+    filename = Column(String(255), nullable=False)
+    sheet_name = Column(String(255), nullable=True)
+    total_students = Column(Integer, nullable=True)
+    passed = Column(Integer, nullable=True)
+    failed = Column(Integer, nullable=True)
+    pass_percent = Column(Float, nullable=True)
+    average_sgpa = Column(Float, nullable=True)
+    institution = Column(String(255), nullable=True)
+    department = Column(String(255), nullable=True)
+    class_name = Column(String(255), nullable=True)
+    semester = Column(String(64), nullable=True)
+    academic_year = Column(String(64), nullable=True)
+    file_hash = Column(String(64), nullable=True)
+
+
+class AuthSession(Base):
+    __tablename__ = "sessions"
+
+    token = Column(String(64), primary_key=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    created_at = Column(String(32), nullable=False)
+    last_seen = Column(String(32), nullable=False)
+
+
+class SessionUpload(Base):
+    __tablename__ = "session_uploads"
+
+    token = Column(String(64), primary_key=True)
+    filename = Column(String(255), nullable=False)
+    file_bytes = Column(LargeBinary, nullable=False)
+    uploaded_at = Column(String(32), nullable=False)
+
+
+class RegistrationPending(Base):
+    __tablename__ = "registration_pending"
+
+    email = Column(String(255), primary_key=True)
+    name = Column(String(255), nullable=False)
+    department = Column(String(255), nullable=True)
+    password_hash = Column(String(255), nullable=False)
+    salt = Column(String(64), nullable=True)
+    code_hash = Column(String(255), nullable=False)
+    code_salt = Column(String(64), nullable=False)
+    created_at = Column(String(32), nullable=False)
+    expires_at = Column(String(32), nullable=False)
+
+
+class PasswordResetPending(Base):
+    __tablename__ = "password_reset_pending"
+
+    email = Column(String(255), primary_key=True)
+    code_hash = Column(String(255), nullable=False)
+    code_salt = Column(String(64), nullable=False)
+    created_at = Column(String(32), nullable=False)
+    expires_at = Column(String(32), nullable=False)
+
+
+_ENGINE_KWARGS = {"future": True, "pool_pre_ping": True}
+if DATABASE_URL.startswith("sqlite"):
+    _ENGINE_KWARGS["connect_args"] = {"check_same_thread": False}
+
+engine = create_engine(DATABASE_URL, **_ENGINE_KWARGS)
+
+if engine.dialect.name == "sqlite":
+
+    @event.listens_for(engine, "connect")
+    def _enable_sqlite_foreign_keys(dbapi_connection, connection_record):
+        cursor = dbapi_connection.cursor()
+        cursor.execute("PRAGMA foreign_keys=ON")
+        cursor.close()
+
+
+SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False, expire_on_commit=False, future=True)
+
+
+@contextmanager
+def db_session():
+    db = SessionLocal()
+    try:
+        yield db
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        db.close()
+
+
+def _normalize_email(email):
+    return (email or "").strip().lower()
+
+
+def _legacy_password_hash(password, salt):
+    salt = (salt or "").strip()
+    if not salt:
+        return ""
+    return pbkdf2_hmac("sha256", password.encode("utf-8"), salt.encode("utf-8"), 120000).hex()
+
+
+def _user_payload(user):
+    return {
+        "id": user.id,
+        "username": user.email,
+        "email": user.email,
+        "name": user.name,
+        "department": user.department,
+        "is_admin": bool(user.is_admin),
+    }
+
+
+def _migrate_legacy_users_table():
+    if engine.dialect.name != "sqlite":
+        return
+
+    inspector = inspect(engine)
+    if "users" not in inspector.get_table_names():
+        return
+
+    columns = {column["name"] for column in inspector.get_columns("users")}
+    if "email" in columns and "password" in columns:
+        return
+
+    source_email_column = "email" if "email" in columns else "username"
+    source_password_column = "password" if "password" in columns else "password_hash"
+    if source_email_column not in columns or source_password_column not in columns:
+        return
+
+    with engine.begin() as conn:
+        conn.exec_driver_sql("PRAGMA foreign_keys=OFF")
+        conn.exec_driver_sql("ALTER TABLE users RENAME TO users_legacy")
+        User.__table__.create(bind=conn)
+        conn.exec_driver_sql(
+            """
+            INSERT INTO users (id, email, name, department, password, salt, is_admin, created_at)
+            SELECT id, lower({email_column}), name, department, {password_column}, salt, COALESCE(is_admin, 0), created_at
+            FROM users_legacy
+            """.format(email_column=source_email_column, password_column=source_password_column)
+        )
+        conn.exec_driver_sql("DROP TABLE users_legacy")
+        conn.exec_driver_sql("PRAGMA foreign_keys=ON")
+
+
+def _sqlite_table_references_target(table_name: str, target_table: str) -> bool:
+    if engine.dialect.name != "sqlite":
+        return False
+
+    inspector = inspect(engine)
+    if table_name not in inspector.get_table_names():
+        return False
+
+    for fk in inspector.get_foreign_keys(table_name):
+        if fk.get("referred_table") == target_table:
+            return True
+    return False
+
+
+def _rebuild_sqlite_table(table_name: str, create_sql_template: str, copy_columns: list[str]):
+    temp_name = f"{table_name}_rebuild_{token_hex(4)}"
+    columns_csv = ", ".join(copy_columns)
+    create_sql = create_sql_template.format(table_name=temp_name)
+
+    with engine.begin() as conn:
+        conn.exec_driver_sql("PRAGMA foreign_keys=OFF")
+        conn.exec_driver_sql(create_sql)
+        conn.exec_driver_sql(
+            f"INSERT INTO {temp_name} ({columns_csv}) SELECT {columns_csv} FROM {table_name}"
+        )
+        conn.exec_driver_sql(f"DROP TABLE {table_name}")
+        conn.exec_driver_sql(f"ALTER TABLE {temp_name} RENAME TO {table_name}")
+        conn.exec_driver_sql("PRAGMA foreign_keys=ON")
+
+
+def _repair_sqlite_foreign_keys():
+    if engine.dialect.name != "sqlite":
+        return
+
+    if _sqlite_table_references_target("sessions", "users_legacy"):
+        _rebuild_sqlite_table(
+            "sessions",
+            """
+            CREATE TABLE {table_name} (
+                token TEXT PRIMARY KEY,
+                user_id INTEGER NOT NULL,
+                created_at TEXT NOT NULL,
+                last_seen TEXT NOT NULL,
+                FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+            )
+            """,
+            ["token", "user_id", "created_at", "last_seen"],
+        )
+
+    if _sqlite_table_references_target("history", "users_legacy"):
+        _rebuild_sqlite_table(
+            "history",
+            """
+            CREATE TABLE {table_name} (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                uploaded_at TEXT NOT NULL,
+                filename TEXT NOT NULL,
+                sheet_name TEXT,
+                total_students INTEGER,
+                passed INTEGER,
+                failed INTEGER,
+                pass_percent REAL,
+                average_sgpa REAL,
+                institution TEXT,
+                department TEXT,
+                class_name TEXT,
+                semester TEXT,
+                academic_year TEXT,
+                file_hash TEXT,
+                FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+            )
+            """,
+            [
+                "id",
+                "user_id",
+                "uploaded_at",
+                "filename",
+                "sheet_name",
+                "total_students",
+                "passed",
+                "failed",
+                "pass_percent",
+                "average_sgpa",
+                "institution",
+                "department",
+                "class_name",
+                "semester",
+                "academic_year",
+                "file_hash",
+            ],
+        )
+
+
 def ensure_db():
     os.makedirs(DATA_DIR, exist_ok=True)
     ensure_faculty_allowlist_template()
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute(
-        """
-        CREATE TABLE IF NOT EXISTS users (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            username TEXT UNIQUE NOT NULL,
-            name TEXT NOT NULL,
-            department TEXT,
-            password_hash TEXT NOT NULL,
-            salt TEXT NOT NULL,
-            is_admin INTEGER DEFAULT 0,
-            created_at TEXT NOT NULL
-        )
-        """
-    )
-    cur.execute(
-        """
-        CREATE TABLE IF NOT EXISTS history (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL,
-            uploaded_at TEXT NOT NULL,
-            filename TEXT NOT NULL,
-            sheet_name TEXT,
-            total_students INTEGER,
-            passed INTEGER,
-            failed INTEGER,
-            pass_percent REAL,
-            average_sgpa REAL,
-            institution TEXT,
-            department TEXT,
-            class_name TEXT,
-            semester TEXT,
-            academic_year TEXT,
-            file_hash TEXT,
-            FOREIGN KEY(user_id) REFERENCES users(id)
-        )
-        """
-    )
-    cur.execute(
-        """
-        CREATE TABLE IF NOT EXISTS sessions (
-            token TEXT PRIMARY KEY,
-            user_id INTEGER NOT NULL,
-            created_at TEXT NOT NULL,
-            last_seen TEXT NOT NULL,
-            FOREIGN KEY(user_id) REFERENCES users(id)
-        )
-        """
-    )
-    cur.execute(
-        """
-        CREATE TABLE IF NOT EXISTS session_uploads (
-            token TEXT PRIMARY KEY,
-            filename TEXT NOT NULL,
-            file_bytes BLOB NOT NULL,
-            uploaded_at TEXT NOT NULL
-        )
-        """
-    )
-    cur.execute(
-        """
-        CREATE TABLE IF NOT EXISTS registration_pending (
-            email TEXT PRIMARY KEY,
-            name TEXT NOT NULL,
-            department TEXT,
-            password_hash TEXT NOT NULL,
-            salt TEXT NOT NULL,
-            code_hash TEXT NOT NULL,
-            code_salt TEXT NOT NULL,
-            created_at TEXT NOT NULL,
-            expires_at TEXT NOT NULL
-        )
-        """
-    )
-    cur.execute(
-        """
-        CREATE TABLE IF NOT EXISTS password_reset_pending (
-            email TEXT PRIMARY KEY,
-            code_hash TEXT NOT NULL,
-            code_salt TEXT NOT NULL,
-            created_at TEXT NOT NULL,
-            expires_at TEXT NOT NULL
-        )
-        """
-    )
-    conn.commit()
-    conn.close()
+    _migrate_legacy_users_table()
+    Base.metadata.create_all(bind=engine)
+    _repair_sqlite_foreign_keys()
+    engine.dispose()
 
 
 def hash_password(password, salt=None):
     if salt is None:
         salt = token_hex(16)
-    hashed = pbkdf2_hmac("sha256", password.encode("utf-8"), salt.encode("utf-8"), 120000).hex()
-    return hashed, salt
+    return generate_password_hash(password), salt
 
 
 def user_email_registered(username):
-    username = username.strip().lower()
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute("SELECT 1 FROM users WHERE username = ? LIMIT 1", (username,))
-    found = cur.fetchone() is not None
-    conn.close()
-    return found
+    username = _normalize_email(username)
+    if not username:
+        return False
+    with db_session() as db:
+        return db.scalar(select(User.id).where(User.email == username)) is not None
 
 
 def reset_user_account(email):
-    email = (email or "").strip().lower()
+    email = _normalize_email(email)
     if not email:
         return False
 
@@ -310,27 +506,20 @@ def reset_user_account(email):
     if os.path.exists(marker_path):
         return False
 
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute("SELECT id FROM users WHERE lower(username) = lower(?) LIMIT 1", (email,))
-    row = cur.fetchone()
-    if row is None:
-        conn.close()
-        return False
+    with db_session() as db:
+        user = db.scalar(select(User).where(User.email == email))
+        if user is None:
+            return False
 
-    user_id = row[0]
-    cur.execute("SELECT token FROM sessions WHERE user_id = ?", (user_id,))
-    tokens = [token_row[0] for token_row in cur.fetchall()]
-    if tokens:
-        cur.executemany("DELETE FROM session_uploads WHERE token = ?", [(token,) for token in tokens])
-        cur.executemany("DELETE FROM sessions WHERE token = ?", [(token,) for token in tokens])
+        tokens = list(db.scalars(select(AuthSession.token).where(AuthSession.user_id == user.id)))
+        if tokens:
+            db.execute(delete(SessionUpload).where(SessionUpload.token.in_(tokens)))
+            db.execute(delete(AuthSession).where(AuthSession.token.in_(tokens)))
 
-    cur.execute("DELETE FROM history WHERE user_id = ?", (user_id,))
-    cur.execute("DELETE FROM registration_pending WHERE lower(email) = lower(?)", (email,))
-    cur.execute("DELETE FROM password_reset_pending WHERE lower(email) = lower(?)", (email,))
-    cur.execute("DELETE FROM users WHERE id = ?", (user_id,))
-    conn.commit()
-    conn.close()
+        db.execute(delete(History).where(History.user_id == user.id))
+        db.execute(delete(RegistrationPending).where(RegistrationPending.email == email))
+        db.execute(delete(PasswordResetPending).where(PasswordResetPending.email == email))
+        db.delete(user)
 
     try:
         with open(marker_path, "w", encoding="utf-8") as f:
@@ -360,10 +549,10 @@ def apply_requested_account_resets():
 
 
 def validate_registration_prerequisites(username, name, department, password, registration_code=None):
-    username = (username or "").strip().lower()
+    username = _normalize_email(username)
     name = (name or "").strip()
     department = (department or "").strip()
-    if not username or not name or not password:
+    if not username or not name or not (password or "").strip():
         return False, "Email, name, and password are required."
     if registration_secret_required() and not registration_secret_valid(registration_code):
         return False, "Wrong or missing registration key. Ask your administrator for the key — it is separate from your password."
@@ -405,10 +594,6 @@ def generate_otp():
 
 def generate_verification_code():
     return generate_otp()
-
-
-def delete_expired_pending_registrations(cur):
-    cur.execute("DELETE FROM registration_pending WHERE expires_at < ?", (datetime.now().isoformat(),))
 
 
 def _pending_registration_cooldown_remaining(created_at: str) -> int:
@@ -469,96 +654,77 @@ def send_registration_verification_email(to_email: str, plain_code: str) -> tupl
     return send_email_otp(to_email, plain_code)
 
 
+def delete_expired_pending_registrations(db):
+    db.execute(delete(RegistrationPending).where(RegistrationPending.expires_at < datetime.now().isoformat()))
+
+
 def request_registration_verification(username, name, department, password, registration_code=None):
     ok, payload = validate_registration_prerequisites(username, name, department, password, registration_code)
     if not ok:
         return False, payload
     data = payload
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    delete_expired_pending_registrations(cur)
-    cur.execute("SELECT created_at FROM registration_pending WHERE email = ?", (data["username"],))
-    existing = cur.fetchone()
-    if existing is not None:
-        wait_seconds = _pending_registration_cooldown_remaining(existing[0])
-        if wait_seconds > 0:
-            conn.close()
-            return False, f"Please wait {wait_seconds} seconds before requesting another code."
+    with db_session() as db:
+        delete_expired_pending_registrations(db)
+        existing = db.get(RegistrationPending, data["username"])
+        if existing is not None:
+            wait_seconds = _pending_registration_cooldown_remaining(existing.created_at)
+            if wait_seconds > 0:
+                return False, f"Please wait {wait_seconds} seconds before requesting another code."
 
-    plain, code_hash, code_salt = generate_otp()
-    send_ok, send_err = send_email_otp(data["username"], plain)
-    if not send_ok:
-        conn.close()
-        return False, send_err
-    password_hash, salt = hash_password(password)
-    now = datetime.now().isoformat()
-    expires = (datetime.now() + timedelta(minutes=OTP_EXPIRY_MINUTES)).isoformat()
-    cur.execute(
-        """
-        INSERT OR REPLACE INTO registration_pending (
-            email, name, department, password_hash, salt, code_hash, code_salt, created_at, expires_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        (
-            data["username"],
-            data["name"],
-            data["department"],
-            password_hash,
-            salt,
-            code_hash,
-            code_salt,
-            now,
-            expires,
-        ),
-    )
-    conn.commit()
-    conn.close()
+        plain, code_hash, code_salt = generate_otp()
+        send_ok, send_err = send_email_otp(data["username"], plain)
+        if not send_ok:
+            return False, send_err
+        password_hash, salt = hash_password(password)
+        now = datetime.now().isoformat()
+        expires = (datetime.now() + timedelta(minutes=OTP_EXPIRY_MINUTES)).isoformat()
+        if existing is None:
+            existing = RegistrationPending(email=data["username"], name=data["name"], department=data["department"])
+            db.add(existing)
+        existing.name = data["name"]
+        existing.department = data["department"]
+        existing.password_hash = password_hash
+        existing.salt = salt
+        existing.code_hash = code_hash
+        existing.code_salt = code_salt
+        existing.created_at = now
+        existing.expires_at = expires
     return True, "Verification code sent. Check your inbox (and spam folder)."
 
 
 def verify_otp(username, code_entered):
-    username = (username or "").strip().lower()
+    username = _normalize_email(username)
     code_entered = (code_entered or "").strip()
     if not username or not code_entered:
         return False, "Enter the verification code from your email."
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    cur = conn.cursor()
-    delete_expired_pending_registrations(cur)
-    cur.execute("SELECT * FROM registration_pending WHERE email = ?", (username,))
-    row = cur.fetchone()
-    if row is None:
-        conn.close()
-        return False, "No pending registration for this email. Request a new verification code."
-    if datetime.now().isoformat() > row["expires_at"]:
-        cur.execute("DELETE FROM registration_pending WHERE email = ?", (username,))
-        conn.commit()
-        conn.close()
-        return False, "That code has expired. Request a new verification code."
-    if not compare_digest(hash_verification_code(code_entered, row["code_salt"]), row["code_hash"]):
-        conn.close()
-        return False, "Invalid verification code."
-    try:
-        cur.execute(
-            """
-            INSERT INTO users (username, name, department, password_hash, salt, is_admin, created_at)
-            VALUES (?, ?, ?, ?, ?, 0, ?)
-            """,
-            (
-                row["email"],
-                row["name"],
-                row["department"],
-                row["password_hash"],
-                row["salt"],
-                datetime.now().isoformat(),
-            ),
-        )
-        cur.execute("DELETE FROM registration_pending WHERE email = ?", (username,))
-        conn.commit()
-    except sqlite3.IntegrityError:
-        conn.close()
-        return False, "An account with this email already exists."
-    conn.close()
+    with db_session() as db:
+        delete_expired_pending_registrations(db)
+        row = db.get(RegistrationPending, username)
+        if row is None:
+            return False, "No pending registration for this email. Request a new verification code."
+        if datetime.now().isoformat() > row.expires_at:
+            db.delete(row)
+            return False, "That code has expired. Request a new verification code."
+        if not compare_digest(hash_verification_code(code_entered, row.code_salt), row.code_hash):
+            return False, "Invalid verification code."
+        try:
+            existing = db.scalar(select(User).where(User.email == username))
+            if existing is not None:
+                return False, "An account with this email already exists."
+            db.add(
+                User(
+                    email=row.email,
+                    name=row.name,
+                    department=row.department,
+                    password_hash=row.password_hash,
+                    salt=row.salt,
+                    is_admin=False,
+                    created_at=datetime.now().isoformat(),
+                )
+            )
+            db.delete(row)
+        except IntegrityError:
+            return False, "An account with this email already exists."
     return True, "Account created."
 
 
@@ -567,203 +733,149 @@ def complete_registration_verification(username, code_entered):
 
 
 def resend_registration_verification(email):
-    email = (email or "").strip().lower()
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    delete_expired_pending_registrations(cur)
-    cur.execute("SELECT email FROM registration_pending WHERE email = ?", (email,))
-    row = cur.fetchone()
-    if row is None:
-        conn.close()
-        return False, "No pending registration. Submit the registration form again."
-    cur.execute("SELECT created_at FROM registration_pending WHERE email = ?", (email,))
-    created_row = cur.fetchone()
-    if created_row is not None:
-        wait_seconds = _pending_registration_cooldown_remaining(created_row[0])
+    email = _normalize_email(email)
+    with db_session() as db:
+        delete_expired_pending_registrations(db)
+        row = db.get(RegistrationPending, email)
+        if row is None:
+            return False, "No pending registration. Submit the registration form again."
+        wait_seconds = _pending_registration_cooldown_remaining(row.created_at)
         if wait_seconds > 0:
-            conn.close()
             return False, f"Please wait {wait_seconds} seconds before requesting another code."
 
-    plain, code_hash, code_salt = generate_otp()
-    send_ok, send_err = send_email_otp(email, plain)
-    if not send_ok:
-        conn.close()
-        return False, send_err
-    now = datetime.now().isoformat()
-    expires = (datetime.now() + timedelta(minutes=OTP_EXPIRY_MINUTES)).isoformat()
-    cur.execute(
-        """
-        UPDATE registration_pending
-        SET code_hash = ?, code_salt = ?, created_at = ?, expires_at = ?
-        WHERE email = ?
-        """,
-        (code_hash, code_salt, now, expires, email),
-    )
-    conn.commit()
-    conn.close()
+        plain, code_hash, code_salt = generate_otp()
+        send_ok, send_err = send_email_otp(email, plain)
+        if not send_ok:
+            return False, send_err
+        row.code_hash = code_hash
+        row.code_salt = code_salt
+        row.created_at = datetime.now().isoformat()
+        row.expires_at = (datetime.now() + timedelta(minutes=OTP_EXPIRY_MINUTES)).isoformat()
     return True, "A new code was sent to your email."
 
 
 def cancel_pending_registration(email):
-    email = (email or "").strip().lower()
+    email = _normalize_email(email)
     if not email:
         return
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute("DELETE FROM registration_pending WHERE email = ?", (email,))
-    conn.commit()
-    conn.close()
+    with db_session() as db:
+        row = db.get(RegistrationPending, email)
+        if row is not None:
+            db.delete(row)
 
 
-def delete_expired_password_resets(cur):
-    cur.execute("DELETE FROM password_reset_pending WHERE expires_at < ?", (datetime.now().isoformat(),))
+def delete_expired_password_resets(db):
+    db.execute(delete(PasswordResetPending).where(PasswordResetPending.expires_at < datetime.now().isoformat()))
 
 
 def request_password_reset_code(username):
-    username = (username or "").strip().lower()
+    username = _normalize_email(username)
     if not username:
         return False, "Enter your email address."
-    if not is_authorized_faculty(username):
-        if not faculty_allowlist_bypassed() and not load_faculty_allowlist():
-            return (
-                False,
-                "No authorized email list is configured yet. An administrator must add allowed emails to data/faculty_allowlist.txt (one per line).",
-            )
-        return False, "This email is not on the authorized list. Contact your administrator."
     if not user_email_registered(username):
         return False, "No account for this email yet."
 
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    delete_expired_password_resets(cur)
-    cur.execute("SELECT created_at FROM password_reset_pending WHERE email = ?", (username,))
-    existing = cur.fetchone()
-    if existing is not None:
-        wait_seconds = _pending_registration_cooldown_remaining(existing[0])
-        if wait_seconds > 0:
-            conn.close()
-            return False, f"Please wait {wait_seconds} seconds before requesting another code."
+    with db_session() as db:
+        delete_expired_password_resets(db)
+        existing = db.get(PasswordResetPending, username)
+        if existing is not None:
+            wait_seconds = _pending_registration_cooldown_remaining(existing.created_at)
+            if wait_seconds > 0:
+                return False, f"Please wait {wait_seconds} seconds before requesting another code."
 
-    plain, code_hash, code_salt = generate_otp()
-    send_ok, send_err = send_email_otp(
-        username,
-        plain,
-        subject="Reset your AIRAS password",
-        intro_lines=[
-            "Use this code on the password reset screen to choose a new password.",
-            "",
-            "This code expires in about 15 minutes.",
-            "",
-            "If you did not request a reset, you can ignore this email.",
-        ],
-    )
-    if not send_ok:
-        conn.close()
-        return False, send_err
+        plain, code_hash, code_salt = generate_otp()
+        send_ok, send_err = send_email_otp(
+            username,
+            plain,
+            subject="Reset your AIRAS password",
+            intro_lines=[
+                "Use this code on the password reset screen to choose a new password.",
+                "",
+                "This code expires in about 15 minutes.",
+                "",
+                "If you did not request a reset, you can ignore this email.",
+            ],
+        )
+        if not send_ok:
+            return False, send_err
 
-    now = datetime.now().isoformat()
-    expires = (datetime.now() + timedelta(minutes=OTP_EXPIRY_MINUTES)).isoformat()
-    cur.execute(
-        """
-        INSERT OR REPLACE INTO password_reset_pending (
-            email, code_hash, code_salt, created_at, expires_at
-        ) VALUES (?, ?, ?, ?, ?)
-        """,
-        (username, code_hash, code_salt, now, expires),
-    )
-    conn.commit()
-    conn.close()
+        now = datetime.now().isoformat()
+        expires = (datetime.now() + timedelta(minutes=OTP_EXPIRY_MINUTES)).isoformat()
+        if existing is None:
+            existing = PasswordResetPending(email=username, code_hash=code_hash, code_salt=code_salt, created_at=now, expires_at=expires)
+            db.add(existing)
+        else:
+            existing.code_hash = code_hash
+            existing.code_salt = code_salt
+            existing.created_at = now
+            existing.expires_at = expires
     return True, "Reset code sent. Check your inbox (and spam folder)."
 
 
 def resend_password_reset_code(email):
-    email = (email or "").strip().lower()
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    delete_expired_password_resets(cur)
-    cur.execute("SELECT created_at FROM password_reset_pending WHERE email = ?", (email,))
-    row = cur.fetchone()
-    if row is None:
-        conn.close()
-        return False, "No pending password reset. Request a new code."
-    wait_seconds = _pending_registration_cooldown_remaining(row[0])
-    if wait_seconds > 0:
-        conn.close()
-        return False, f"Please wait {wait_seconds} seconds before requesting another code."
+    email = _normalize_email(email)
+    with db_session() as db:
+        delete_expired_password_resets(db)
+        row = db.get(PasswordResetPending, email)
+        if row is None:
+            return False, "No pending password reset. Request a new code."
+        wait_seconds = _pending_registration_cooldown_remaining(row.created_at)
+        if wait_seconds > 0:
+            return False, f"Please wait {wait_seconds} seconds before requesting another code."
 
-    plain, code_hash, code_salt = generate_otp()
-    send_ok, send_err = send_email_otp(
-        email,
-        plain,
-        subject="Reset your AIRAS password",
-        intro_lines=[
-            "Use this code on the password reset screen to choose a new password.",
-            "",
-            "This code expires in about 15 minutes.",
-            "",
-            "If you did not request a reset, you can ignore this email.",
-        ],
-    )
-    if not send_ok:
-        conn.close()
-        return False, send_err
-
-    now = datetime.now().isoformat()
-    expires = (datetime.now() + timedelta(minutes=OTP_EXPIRY_MINUTES)).isoformat()
-    cur.execute(
-        """
-        UPDATE password_reset_pending
-        SET code_hash = ?, code_salt = ?, created_at = ?, expires_at = ?
-        WHERE email = ?
-        """,
-        (code_hash, code_salt, now, expires, email),
-    )
-    conn.commit()
-    conn.close()
+        plain, code_hash, code_salt = generate_otp()
+        send_ok, send_err = send_email_otp(
+            email,
+            plain,
+            subject="Reset your AIRAS password",
+            intro_lines=[
+                "Use this code on the password reset screen to choose a new password.",
+                "",
+                "This code expires in about 15 minutes.",
+                "",
+                "If you did not request a reset, you can ignore this email.",
+            ],
+        )
+        if not send_ok:
+            return False, send_err
+        row.code_hash = code_hash
+        row.code_salt = code_salt
+        row.created_at = datetime.now().isoformat()
+        row.expires_at = (datetime.now() + timedelta(minutes=OTP_EXPIRY_MINUTES)).isoformat()
     return True, "A new reset code was sent to your email."
 
 
 def complete_password_reset(username, code_entered, new_password):
-    username = (username or "").strip().lower()
+    username = _normalize_email(username)
     code_entered = (code_entered or "").strip()
     new_password = (new_password or "").strip()
     if not username or not code_entered or not new_password:
         return False, "Enter the reset code and a new password."
 
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    cur = conn.cursor()
-    delete_expired_password_resets(cur)
-    cur.execute("SELECT * FROM password_reset_pending WHERE email = ?", (username,))
-    row = cur.fetchone()
-    if row is None:
-        conn.close()
-        return False, "No pending password reset for this email. Request a new code."
-    if datetime.now().isoformat() > row["expires_at"]:
-        cur.execute("DELETE FROM password_reset_pending WHERE email = ?", (username,))
-        conn.commit()
-        conn.close()
-        return False, "That code has expired. Request a new code."
-    if not compare_digest(hash_verification_code(code_entered, row["code_salt"]), row["code_hash"]):
-        conn.close()
-        return False, "Invalid reset code."
+    with db_session() as db:
+        delete_expired_password_resets(db)
+        row = db.get(PasswordResetPending, username)
+        if row is None:
+            return False, "No pending password reset for this email. Request a new code."
+        if datetime.now().isoformat() > row.expires_at:
+            db.delete(row)
+            return False, "That code has expired. Request a new code."
+        if not compare_digest(hash_verification_code(code_entered, row.code_salt), row.code_hash):
+            return False, "Invalid reset code."
 
-    cur.execute("SELECT id FROM users WHERE lower(username) = lower(?) LIMIT 1", (username,))
-    user_row = cur.fetchone()
-    if user_row is None:
-        cur.execute("DELETE FROM password_reset_pending WHERE email = ?", (username,))
-        conn.commit()
-        conn.close()
-        return False, "No account for this email yet."
+        user = db.scalar(select(User).where(User.email == username))
+        if user is None:
+            db.delete(row)
+            return False, "No account for this email yet."
 
-    password_hash, salt = hash_password(new_password)
-    user_id = user_row["id"]
-    cur.execute("UPDATE users SET password_hash = ?, salt = ? WHERE id = ?", (password_hash, salt, user_id))
-    cur.execute("DELETE FROM session_uploads WHERE token IN (SELECT token FROM sessions WHERE user_id = ?)", (user_id,))
-    cur.execute("DELETE FROM sessions WHERE user_id = ?", (user_id,))
-    cur.execute("DELETE FROM password_reset_pending WHERE email = ?", (username,))
-    conn.commit()
-    conn.close()
+        password_hash, salt = hash_password(new_password)
+        user.password_hash = password_hash
+        user.salt = salt
+        tokens = list(db.scalars(select(AuthSession.token).where(AuthSession.user_id == user.id)))
+        if tokens:
+            db.execute(delete(SessionUpload).where(SessionUpload.token.in_(tokens)))
+        db.execute(delete(AuthSession).where(AuthSession.user_id == user.id))
+        db.delete(row)
     return True, "Password updated. You can log in with your new password."
 
 
@@ -773,150 +885,107 @@ def create_user(username, name, department, password, is_admin=0, registration_c
         return False, payload
     data = payload
     password_hash, salt = hash_password(password)
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    try:
-        cur.execute(
-            """
-            INSERT INTO users (username, name, department, password_hash, salt, is_admin, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-            """,
-            (data["username"], data["name"], data["department"], password_hash, salt, is_admin, datetime.now().isoformat()),
+    with db_session() as db:
+        existing = db.scalar(select(User).where(User.email == data["username"]))
+        if existing is not None:
+            return False, "An account with this email already exists."
+        db.add(
+            User(
+                email=data["username"],
+                name=data["name"],
+                department=data["department"],
+                password_hash=password_hash,
+                salt=salt,
+                is_admin=bool(is_admin),
+                created_at=datetime.now().isoformat(),
+            )
         )
-        conn.commit()
-    except sqlite3.IntegrityError:
-        conn.close()
-        return False, "An account with this email already exists."
-    conn.close()
     return True, "Account created."
 
 
 def authenticate_user(username, password):
-    username = username.strip().lower()
-    if not is_authorized_faculty(username):
+    username = _normalize_email(username)
+    if not username:
         return None
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    cur = conn.cursor()
-    cur.execute("SELECT * FROM users WHERE username = ?", (username,))
-    row = cur.fetchone()
-    conn.close()
-    if row is None:
+    with db_session() as db:
+        user = db.scalar(select(User).where(User.email == username))
+        if user is None:
+            return None
+        if check_password_hash(user.password_hash, password):
+            return _user_payload(user)
+        if user.salt and compare_digest(_legacy_password_hash(password, user.salt), user.password_hash):
+            user.password_hash = generate_password_hash(password)
+            user.salt = token_hex(16)
+            return _user_payload(user)
         return None
-    hashed = pbkdf2_hmac("sha256", password.encode("utf-8"), row["salt"].encode("utf-8"), 120000).hex()
-    if hashed != row["password_hash"]:
-        return None
-    return {
-        "id": row["id"],
-        "username": row["username"],
-        "name": row["name"],
-        "department": row["department"],
-        "is_admin": bool(row["is_admin"]),
-    }
 
 
 def create_session(user_id):
     token = token_hex(24)
     now = datetime.now().isoformat()
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute(
-        """
-        INSERT INTO sessions (token, user_id, created_at, last_seen)
-        VALUES (?, ?, ?, ?)
-        """,
-        (token, user_id, now, now),
-    )
-    conn.commit()
-    conn.close()
+    with db_session() as db:
+        db.add(AuthSession(token=token, user_id=user_id, created_at=now, last_seen=now))
     return token
 
 
 def get_user_by_session(token):
     if not token:
         return None
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    cur = conn.cursor()
-    cur.execute(
-        """
-        SELECT u.*
-        FROM sessions s
-        JOIN users u ON s.user_id = u.id
-        WHERE s.token = ?
-        """,
-        (token,),
-    )
-    row = cur.fetchone()
-    if row:
-        cur.execute("UPDATE sessions SET last_seen = ? WHERE token = ?", (datetime.now().isoformat(), token))
-        conn.commit()
-    conn.close()
-    if row is None:
-        return None
-    return {
-        "id": row["id"],
-        "username": row["username"],
-        "name": row["name"],
-        "department": row["department"],
-        "is_admin": bool(row["is_admin"]),
-    }
+    with db_session() as db:
+        session_row = db.get(AuthSession, token)
+        if session_row is None:
+            return None
+        user = db.get(User, session_row.user_id)
+        if user is None:
+            db.delete(session_row)
+            return None
+        session_row.last_seen = datetime.now().isoformat()
+        return _user_payload(user)
 
 
 def delete_session(token):
     if not token:
         return
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute("DELETE FROM sessions WHERE token = ?", (token,))
-    conn.commit()
-    conn.close()
+    with db_session() as db:
+        session_row = db.get(AuthSession, token)
+        if session_row is not None:
+            db.delete(session_row)
 
 
 def save_session_upload(token, filename, file_bytes):
     if not token or not file_bytes:
         return
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute(
-        """
-        INSERT OR REPLACE INTO session_uploads (token, filename, file_bytes, uploaded_at)
-        VALUES (?, ?, ?, ?)
-        """,
-        (token, filename, sqlite3.Binary(file_bytes), datetime.now().isoformat()),
-    )
-    conn.commit()
-    conn.close()
+    with db_session() as db:
+        existing = db.get(SessionUpload, token)
+        if existing is None:
+            existing = SessionUpload(token=token, filename=filename, file_bytes=bytes(file_bytes), uploaded_at=datetime.now().isoformat())
+            db.add(existing)
+        else:
+            existing.filename = filename
+            existing.file_bytes = bytes(file_bytes)
+            existing.uploaded_at = datetime.now().isoformat()
 
 
 def load_session_upload(token):
     if not token:
         return None, None
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute(
-        """
-        SELECT filename, file_bytes
-        FROM session_uploads
-        WHERE token = ?
-        """,
-        (token,),
-    )
-    row = cur.fetchone()
-    conn.close()
-    if not row:
-        return None, None
-    return row[0], row[1]
+    with db_session() as db:
+        row = db.get(SessionUpload, token)
+        if row is None:
+            return None, None
+        file_bytes = row.file_bytes
+        if file_bytes is not None and not isinstance(file_bytes, (bytes, bytearray)):
+            file_bytes = bytes(file_bytes)
+        return row.filename, file_bytes
 
 
 def delete_session_upload(token):
     if not token:
         return
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute("DELETE FROM session_uploads WHERE token = ?", (token,))
-    conn.commit()
-    conn.close()
+    with db_session() as db:
+        row = db.get(SessionUpload, token)
+        if row is not None:
+            db.delete(row)
 
 
 def get_query_param(name):
@@ -960,56 +1029,51 @@ def record_history(user_id, file_bytes, filename, sheet_name, overview, profile)
     if st.session_state.get("last_history_signature") == signature:
         return
 
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.cursor()
-    cur.execute(
-        """
-        INSERT INTO history (
-            user_id, uploaded_at, filename, sheet_name, total_students, passed, failed,
-            pass_percent, average_sgpa, institution, department, class_name, semester,
-            academic_year, file_hash
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        (
-            user_id,
-            datetime.now().isoformat(),
-            filename,
-            sheet_name,
-            overview.get("total_students"),
-            overview.get("passed"),
-            overview.get("failed"),
-            overview.get("pass_percent"),
-            overview.get("average_sgpa"),
-            profile.get("institution"),
-            profile.get("department"),
-            profile.get("class_name"),
-            profile.get("semester"),
-            profile.get("academic_year"),
-            file_hash,
-        ),
-    )
-    conn.commit()
-    conn.close()
+    with db_session() as db:
+        db.add(
+            History(
+                user_id=user_id,
+                uploaded_at=datetime.now().isoformat(),
+                filename=filename,
+                sheet_name=sheet_name,
+                total_students=overview.get("total_students"),
+                passed=overview.get("passed"),
+                failed=overview.get("failed"),
+                pass_percent=overview.get("pass_percent"),
+                average_sgpa=overview.get("average_sgpa"),
+                institution=profile.get("institution"),
+                department=profile.get("department"),
+                class_name=profile.get("class_name"),
+                semester=profile.get("semester"),
+                academic_year=profile.get("academic_year"),
+                file_hash=file_hash,
+            )
+        )
     st.session_state["last_history_signature"] = signature
 
 
 def fetch_history(user_id, limit=200):
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    cur = conn.cursor()
-    cur.execute(
-        """
-        SELECT uploaded_at, filename, sheet_name, total_students, passed, failed, pass_percent,
-               average_sgpa, institution, department, class_name, semester, academic_year
-        FROM history
-        WHERE user_id = ?
-        ORDER BY uploaded_at DESC
-        LIMIT ?
-        """,
-        (user_id, limit),
-    )
-    rows = cur.fetchall()
-    conn.close()
+    with db_session() as db:
+        rows = db.execute(
+            select(
+                History.uploaded_at,
+                History.filename,
+                History.sheet_name,
+                History.total_students,
+                History.passed,
+                History.failed,
+                History.pass_percent,
+                History.average_sgpa,
+                History.institution,
+                History.department,
+                History.class_name,
+                History.semester,
+                History.academic_year,
+            )
+            .where(History.user_id == user_id)
+            .order_by(History.uploaded_at.desc())
+            .limit(limit)
+        ).all()
     if not rows:
         return pd.DataFrame(
             columns=[
@@ -1028,7 +1092,7 @@ def fetch_history(user_id, limit=200):
                 "academic_year",
             ]
         )
-    return pd.DataFrame([dict(row) for row in rows])
+    return pd.DataFrame([dict(row._mapping) for row in rows])
 
 
 def grade_from_sgpa(sgpa):
@@ -3124,8 +3188,6 @@ def login_screen():
             if submit:
                 if not username.strip() or not password:
                     st.error("Enter your email and password.")
-                elif not faculty_allowlist_bypassed() and not is_authorized_faculty(username):
-                    st.error("This email is not authorized to access this portal. Contact your administrator.")
                 else:
                     user = authenticate_user(username, password)
                     if user:
