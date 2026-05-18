@@ -4,7 +4,7 @@ AIRAS is a Streamlit-based dashboard for faculty to upload semester result workb
 
 ## What It Does
 
-- Secure faculty login with SQLite-backed users and session restore
+- Secure faculty login with SQLAlchemy-backed users and session restore
 - Upload and analyze `.xlsx` result sheets
 - Auto-detect subjects, grades, SGPA, and term-wise sections
 - Explore class overview, subject intelligence, grade sheets, student drill-down, and history
@@ -27,10 +27,14 @@ This repo is set up for container deployment.
 
 - [`Dockerfile`](Dockerfile) starts the app in a deployable container
 - [`start.py`](start.py) respects cloud-provided `PORT`
-- SQLite data defaults to `/data` inside the container so you can mount persistent storage
+- SQLite is used automatically for local development when `DATABASE_URL` is not set
+- PostgreSQL is supported through `DATABASE_URL` for Render and other hosts
+- [`render.yaml`](render.yaml) can create the Render web service and PostgreSQL database for you through Blueprints
 - [`streamlit_app.py`](streamlit_app.py) is the Streamlit Community Cloud entrypoint
 
 Full instructions are in [`DEPLOYMENT.md`](DEPLOYMENT.md).
+
+If you already created users locally in `data/app.db`, use [`migrate_users_to_postgres.py`](migrate_users_to_postgres.py) to copy them into Render's PostgreSQL database.
 
 ## Required Configuration
 
@@ -51,5 +55,5 @@ Optional configuration includes SMTP settings for email verification and `AIRAS_
 
 ## Notes
 
-- The app can run on Streamlit Community Cloud, but SQLite data there is ephemeral.
-- For durable user accounts and upload history, use a Docker-capable host with persistent storage.
+- The app can run on Streamlit Community Cloud, but file-based storage there is still ephemeral.
+- For durable user accounts and upload history, use Render or another host with PostgreSQL via `DATABASE_URL`, or mount persistent storage if you stay on SQLite.
