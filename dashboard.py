@@ -294,19 +294,29 @@ class PasswordResetPending(Base):
     expires_at = Column(String(32), nullable=False)
 
 
-_ENGINE_KWARGS = {"future": True, "pool_pre_ping": True}
-if DATABASE_URL.startswith("sqlite"):
-    _ENGINE_KWARGS["connect_args"] = {"check_same_thread": False}
+@st.cache_resource(show_spinner=False)
+def get_database_engine(database_url):
+    """Create one SQLAlchemy engine per Streamlit process instead of recreating it on every rerun."""
+    engine_kwargs = {"future": True, "pool_pre_ping": True}
+    if database_url.startswith("sqlite"):
+        engine_kwargs["connect_args"] = {"check_same_thread": False}
+    else:
+        # Keep idle PostgreSQL connections from becoming stale on hosted services.
+        engine_kwargs.update({"pool_recycle": 1800, "pool_timeout": 30})
 
-engine = create_engine(DATABASE_URL, **_ENGINE_KWARGS)
+    db_engine = create_engine(database_url, **engine_kwargs)
 
-if engine.dialect.name == "sqlite":
+    if db_engine.dialect.name == "sqlite":
+        @event.listens_for(db_engine, "connect")
+        def _enable_sqlite_foreign_keys(dbapi_connection, connection_record):
+            cursor = dbapi_connection.cursor()
+            cursor.execute("PRAGMA foreign_keys=ON")
+            cursor.close()
 
-    @event.listens_for(engine, "connect")
-    def _enable_sqlite_foreign_keys(dbapi_connection, connection_record):
-        cursor = dbapi_connection.cursor()
-        cursor.execute("PRAGMA foreign_keys=ON")
-        cursor.close()
+    return db_engine
+
+
+engine = get_database_engine(DATABASE_URL)
 
 
 SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False, expire_on_commit=False, future=True)
@@ -473,13 +483,20 @@ def _repair_sqlite_foreign_keys():
         )
 
 
+@st.cache_resource(show_spinner=False)
 def ensure_db():
+    """Initialize the database once per Streamlit process.
+
+    Streamlit reruns the script for widget interactions; caching this operation
+    prevents repeated schema creation/disposal from destabilizing PostgreSQL
+    connections on hosted deployments.
+    """
     os.makedirs(DATA_DIR, exist_ok=True)
     ensure_faculty_allowlist_template()
     _migrate_legacy_users_table()
     Base.metadata.create_all(bind=engine)
     _repair_sqlite_foreign_keys()
-    engine.dispose()
+    return True
 
 
 def hash_password(password, salt=None):
